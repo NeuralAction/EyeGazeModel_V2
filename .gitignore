@@ -1,0 +1,12 @@
+# python caches
+__pycache__/
+*.pyc
+
+# graph logs
+MEAN ACC*.png
+
+# checkpoints
+*.ckpt.*
+checkpoint
+checkpoint_state
+saved_checkpoint*
