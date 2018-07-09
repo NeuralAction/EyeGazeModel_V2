@@ -1,4 +1,5 @@
 # python caches
+temp/
 __pycache__/
 *.pyc
 

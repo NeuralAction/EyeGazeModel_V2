@@ -24,9 +24,12 @@ import nn
 from util import *
 
 class Dataset:
-    def __init__(self, paths, eyeSize, faceSize):
+    def __init__(self, paths, eyeSize, faceSize, decodeLeft = True, decodeRight = True, decodeFace = True):
         self.eyeSize = eyeSize
         self.faceSize = faceSize
+        self.decodeLeft = decodeLeft
+        self.decodeRight = decodeRight
+        self.decodeFace = decodeFace
         self.count = 0
         self.testPercent = 0.1
         self.datas = []
@@ -73,10 +76,13 @@ class Dataset:
         return out
 
     class Proc:
-        def __init__(self, eyeSize, faceSize, randomize):
+        def __init__(self, eyeSize, faceSize, randomize, decodeLeft, decodeRight, decodeFace):
             self.randomize = randomize
             self.eyeSize = eyeSize
             self.faceSize = faceSize
+            self.decodeLeft = decodeLeft
+            self.decodeRight = decodeRight
+            self.decodeFace = decodeFace
             self.randmul = 0.3
             self.randadd = 15
 
@@ -118,27 +124,42 @@ class Dataset:
             return [rod1, rod2]
         
         def __call__(self, fileL):
+            imgL = None
+            imgR = None
+            imgF = None
             fileR = fileL.replace("left", "right")
             fileF = fileL.replace("left", "face")
-            imgL = self.decodeImage(fileL, self.eyeSize, self.randomize)
-            imgR = self.decodeImage(fileR, self.eyeSize, self.randomize)
-            imgF = self.decodeImage(fileF, self.faceSize, self.randomize)
+            if(self.decodeLeft):
+                imgL = self.decodeImage(fileL, self.eyeSize, self.randomize)
+            if(self.decodeRight):
+                imgR = self.decodeImage(fileR, self.eyeSize, self.randomize)
+            if(self.decodeFace):
+                imgF = self.decodeImage(fileF, self.faceSize, self.randomize)
             label = self.parseLabel(fileL)
             del fileR, fileF, fileL
             return imgL, imgR, imgF, label
 
     def internalBatch(self, count, files, randomize):
         labels = np.empty(shape=[count, 2], dtype='float32')
-        left = np.empty(shape=[count, self.eyeSize, self.eyeSize, 3], dtype='float32')
-        right = np.empty(shape=[count, self.eyeSize, self.eyeSize, 3], dtype='float32')
-        face = np.empty(shape=[count, self.faceSize, self.faceSize, 3], dtype='float32')
+        left = None
+        if(self.decodeLeft):
+            left = np.empty(shape=[count, self.eyeSize, self.eyeSize, 3], dtype='float32')
+        right = None
+        if(self.decodeRight):
+            right = np.empty(shape=[count, self.eyeSize, self.eyeSize, 3], dtype='float32')
+        face = None
+        if(self.decodeFace):
+            face = np.empty(shape=[count, self.faceSize, self.faceSize, 3], dtype='float32')
         ind = 0
-        proc = self.Proc(self.eyeSize, self.faceSize, randomize)
+        proc = self.Proc(self.eyeSize, self.faceSize, randomize, self.decodeLeft, self.decodeRight, self.decodeFace)
         result = self.pool.map(proc, files)
         for i in result:
-            left[ind, :, :, :] = i[0]
-            right[ind, :, :, :] = i[1]
-            face[ind, :, :, :] = i[2]
+            if(self.decodeLeft):
+                left[ind, :, :, :] = i[0]
+            if(self.decodeRight):
+                right[ind, :, :, :] = i[1]
+            if(self.decodeFace):
+                face[ind, :, :, :] = i[2]
             labels[ind, : ] = i[3]
             ind += 1
         del result[:]
@@ -182,6 +203,146 @@ class ModelBatchData:
         del self.right
         if(not self.label is None):
             del self.label
+
+class ModelEye(nn.NNModel):
+    def __init__(self, eyeSize = 60, dataSize = 10000, batchSize = 100, useRateDecay = True, rateDecayEpoch = 5, useSELU = False, useSwitching = False, useWeightDecay = True, useMobileNet = False):
+        super(ModelEye, self).__init__()
+        self.eyeSize = eyeSize
+        self.dataSize = dataSize
+        self.batchSize = batchSize
+        self.useRateDecay = useRateDecay
+        self.rateDecayEpoch = rateDecayEpoch
+        self.useSELU = useSELU
+        nn.useSELU = useSELU
+        self.useMobileNet = useMobileNet
+        self.useBnorm = not useSELU
+        self.dropRate = 0.7
+        self.testDropRate = 1.0
+        if(self.useSELU):
+            self.dropRate =  0.05
+            self.testDropRate = 0.0
+        self.step = 0
+        self.useSwitching = useSwitching
+        self.useWeightDecay = useWeightDecay
+
+        self.inputLeft = tf.placeholder(tf.float32, shape = [None, self.eyeSize, self.eyeSize, 3], name = 'input_left')
+        self.inputLabel = tf.placeholder(tf.float32, shape = [None, 2])
+        
+        self.buildModel()
+    
+    def buildModel(self):
+        self.featureEyes = self.buildEyes(self.inputLeft)
+        self.output = self.buildRegression(self.featureEyes)
+        self.loss = self.buildLoss(self.output, self.inputLabel)
+        self.buildTrainer(self.loss)
+    
+    def buildEye(self, pool):
+        n = NameGenerator('eye')
+        pool = self.conv2d(n.new(), pool, [3, 3, 24], poolsize = 1, useMobile = False)
+        pool = self.conv2d(n.new(), pool, [3, 3, 24], useMobile = False) #32
+        pool = self.resBlock(n.new(), pool, [3, 3, 32], poolsize = 1)
+        pool = self.resBlock(n.new(), pool, [3, 3, 32], poolsize = 1)
+        pool = self.resBlock(n.new(), pool, [3, 3, 32], poolsize = 1)
+        pool = self.conv2d(n.new(), pool, [3, 3, 32]) #16
+        pool = self.resBlock(n.new(), pool, [3, 3, 64])
+        pool = self.resBlock(n.new(), pool, [3, 3, 64])
+        pool = self.resBlock(n.new(), pool, [3, 3, 64])
+        pool = self.resBlock(n.new(), pool, [3, 3, 64])
+        pool = self.conv2d(n.new(), pool, [3, 3, 128]) #8
+        pool = self.resBlock(n.new(), pool, [3, 3, 128])
+        pool = self.resBlock(n.new(), pool, [3, 3, 128])
+        pool = self.conv2d(n.new(), pool, [3, 3, 128]) #4
+        return pool
+
+    def buildEyes(self, inputLeft):
+        n = NameGenerator('eyes')
+        pool = self.buildEye(inputLeft)
+        pool = nn.flat(pool)
+        pool = self.fc(n.new(), pool, 32)
+        return pool
+
+    def buildRegression(self, pool):
+        n = NameGenerator('regFc')
+        pool = self.reg(n.new(), pool, 2, opName = "output")
+        return pool
+
+    def buildLoss(self, output, label, useLearningRateDecay = True):
+        with tf.name_scope('loss'):
+            self.error = tf.reduce_mean(tf.sqrt(tf.reduce_sum(tf.square(output - label), axis = 1)))
+            tf.summary.scalar('error', self.error)
+            self.loss = tf.square(self.error)
+            tf.summary.scalar('loss', self.loss)
+            self.weightDecayLoss = nn.weightDecayLoss(self.loss)
+            tf.summary.scalar('weightDecayLoss', self.weightDecayLoss)
+            self.errorDegree = tf.atan(self.error) / 3.141592 * 180
+            tf.summary.scalar('errorDegree', self.errorDegree)
+            self.errorCm = self.error * 40.0
+            tf.summary.scalar('errorCm', self.errorCm)
+        return self.loss
+
+    def buildTrainer(self, loss, learningRate = 0.001):
+        self.global_step = tf.Variable(0, trainable=False)
+        if(self.useRateDecay):
+            decay_r = self.dataSize / self.batchSize * self.rateDecayEpoch
+            self.learning_rate = tf.train.exponential_decay(learningRate, self.global_step, int(decay_r), 0.7, staircase=True)
+        else:
+            self.learning_rate = tf.constant(learningRate)
+        tf.summary.scalar('learningRate', self.learning_rate)
+        self.adamOptimizer = tf.train.AdamOptimizer(learning_rate = self.learning_rate)
+        self.sgdOptimizer = tf.train.GradientDescentOptimizer(learning_rate = self.learning_rate * 10)
+        self.adamTrainStep = nn.gradientClippedMinimize(self.adamOptimizer, loss, global_step=self.global_step, useClip = True)
+        if self.useWeightDecay:
+            loss = self.weightDecayLoss
+        self.sgdTrainStep = nn.gradientClippedMinimize(self.sgdOptimizer, loss, global_step=self.global_step, useClip = True)
+    
+    def getLoss(self):
+        if(self.getTrainStep() == self.sgdOptimizer and self.useWeightDecay):
+            return self.weightDecayLoss
+        return self.loss
+
+    def getTrainStep(self):
+        if(self.ephoc > self.rateDecayEpoch and self.useSwitching):
+            return self.sgdTrainStep
+        return self.adamTrainStep
+
+    def getFeedDict(self, batchData, isTrain):
+        feed = \
+        { 
+            self.inputLeft : batchData.left, 
+            self.inputLabel : batchData.label, 
+            self.keep_prob : self.dropRate, 
+            self.phase_train : True 
+        }
+        if not isTrain:
+            feed[self.phase_train] = False
+            feed[self.keep_prob] = self.testDropRate
+        return feed
+
+    def forward(self, sess, batchData, summary = None):
+        feed = self.getFeedDict(batchData, False)
+        fetch = [ self.getLoss(), self.error ]
+        if not summary is None:
+            fetch.append(summary)
+        result = sess.run(fetch, feed_dict = feed)
+        del fetch[:]
+        del feed, fetch
+        if not summary is None:
+            return result[0 : len(result)-1], result[-1]
+        return result
+
+    def optimize(self, sess, batchData, summary = None):
+        self.step += 1
+        self.ephoc = int(self.step * self.batchSize / self.dataSize)
+        feed = self.getFeedDict(batchData, True)
+        fetch = [ self.getTrainStep(), self.getLoss(), self.error ]
+        if not summary is None:
+            fetch.append(summary)
+        result = sess.run(fetch, feed_dict = feed)
+        del fetch[:]
+        del feed, fetch
+        if not summary is None:
+            return result[1 : len(result) - 1], result[-1]
+        return result[1:]
         
 class Model(nn.NNModel):
     def __init__(self, faceSize = 60, eyeSize = 60, dataSize = 10000, batchSize = 100, useRateDecay = True, rateDecayEpoch = 5, useSELU = False, useSwitching = False, useWeightDecay = True, useMobileNet = False):
@@ -361,7 +522,7 @@ def backup(path):
     print("copy me to", fileDist)
     shutil.copy2(fileMe, fileDist)
 
-def loadData(eyeSize, faceSize):
+def loadData(eyeSize, faceSize, decodeLeft = True, decodeRight = True, decodeFace = True):
     basedir = "C:\\Library\\koi 2017\\Source\\GazeDataset\\"
     dataList = [
         basedir + "eyesub1\\", 
@@ -390,7 +551,7 @@ def loadData(eyeSize, faceSize):
         basedir + "eyesub24\\",
         basedir + "eyesub25\\",
         ]
-    data = Dataset(dataList, eyeSize = eyeSize, faceSize = faceSize)
+    data = Dataset(dataList, eyeSize = eyeSize, faceSize = faceSize, decodeLeft = decodeLeft, decodeRight = decodeRight, decodeFace = decodeFace)
     return data
 
 class ModelTester:
@@ -538,18 +699,33 @@ def train():
     lastEphoc = 0
     fpsCounter = FpsCounter()
 
-    data = loadData(faceSize = faceSize, eyeSize = eyeSize)
-    model = Model(\
-        faceSize = faceSize, 
-        eyeSize = eyeSize, 
-        dataSize = data.count,
-        batchSize = batchSize, 
-        useSELU = True,
-        useRateDecay = True,
-        rateDecayEpoch = 12,
-        useSwitching = True,
-        useWeightDecay = True,
-        useMobileNet = True)
+    mode = "eye"
+    if mode=="eye":
+        eyeSize = 64
+        data = loadData(faceSize = faceSize, eyeSize = eyeSize, decodeLeft = True, decodeRight = False, decodeFace = False)
+        model = ModelEye(\
+            eyeSize = eyeSize,
+            dataSize = data.count,
+            batchSize = batchSize,
+            useRateDecay = True,
+            rateDecayEpoch = 12,
+            useSELU = True,
+            useSwitching = True,
+            useWeightDecay = False,
+            useMobileNet = False)
+    else:
+        data = loadData(faceSize = faceSize, eyeSize = eyeSize)
+        model = Model(\
+            faceSize = faceSize, 
+            eyeSize = eyeSize, 
+            dataSize = data.count,
+            batchSize = batchSize, 
+            useSELU = True,
+            useRateDecay = True,
+            rateDecayEpoch = 12,
+            useSwitching = True,
+            useWeightDecay = True,
+            useMobileNet = True)
     nn.weightReport()
 
     def signal_handler(signal, frame):
@@ -607,5 +783,5 @@ def train():
             del fetch, summary, batch
 
 if (__name__ == '__main__'):
-    #train()
-    testAndFreeze('test 04-07_18-54-48')
+    train()
+    #testAndFreeze('test 04-07_18-54-48')
