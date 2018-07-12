@@ -348,6 +348,20 @@ def inferenceAccuracy(y, label):
         acc = tf.reduce_mean(tf.cast(correctPrediction(y, label), "float"))
     return acc
 
+def LoopedExponentialDecayLearningRate(global_step, startRate = 0.001, duration = 1000, decayStep = 100, decayRate = 0.7, durationRate = 1.5):
+    global_step = tf.cast(global_step, tf.float32)
+    return startRate * tf.pow(decayRate, tf.floor((global_step - tf.floor(global_step / duration) * duration) / decayStep))
+    l = tf.floor(\
+                tf.log(\
+                        (durationRate - 1.0) * global_step / duration + 1.0)\
+                         / tf.log(durationRate))
+    j = (global_step / duration - \
+            (1.0 - tf.pow(durationRate, l)) / \
+                (1.0 - durationRate)) / \
+            tf.pow(durationRate, l) * duration
+    a = startRate * tf.pow(decayRate, tf.floor(j / decayStep))
+    return a
+
 def learningRateDecay(learningRate, decayRate, global_step, dataSize, batchSize, rateDecayEpoch):
     decay_r = dataSize / batchSize * rateDecayEpoch
     learning_rate = tf.train.exponential_decay(learningRate, global_step, int(decay_r), decayRate, staircase=True)

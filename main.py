@@ -284,7 +284,9 @@ class ModelEye(nn.NNModel):
         self.global_step = tf.Variable(0, trainable=False)
         if(self.useRateDecay):
             decay_r = self.dataSize / self.batchSize * self.rateDecayEpoch
-            self.learning_rate = tf.train.exponential_decay(learningRate, self.global_step, int(decay_r), 0.7, staircase=True)
+            #self.learning_rate = tf.train.exponential_decay(learningRate, self.global_step, int(decay_r), 0.7, staircase=True)
+            #decay_r = decay_r * 0.1
+            self.learning_rate = nn.LoopedExponentialDecayLearningRate(self.global_step, learningRate)
         else:
             self.learning_rate = tf.constant(learningRate)
         tf.summary.scalar('learningRate', self.learning_rate)
@@ -345,7 +347,7 @@ class ModelEye(nn.NNModel):
         return result[1:]
         
 class Model(nn.NNModel):
-    def __init__(self, faceSize = 60, eyeSize = 60, dataSize = 10000, batchSize = 100, useRateDecay = True, rateDecayEpoch = 5, useSELU = False, useSwitching = False, useWeightDecay = True, useMobileNet = False):
+    def __init__(self, faceSize = 60, eyeSize = 60, dataSize = 10000, batchSize = 100, useRateDecay = True, rateDecayEpoch = 5, useSELU = False, useSwitching = False, useWeightDecay = True, useMobileNet = False, useCycleRate = False):
         super(Model, self).__init__()
         self.faceSize = faceSize
         self.eyeSize = eyeSize
@@ -365,6 +367,7 @@ class Model(nn.NNModel):
         self.step = 0
         self.useSwitching = useSwitching
         self.useWeightDecay = useWeightDecay
+        self.useCycleRate = useCycleRate
 
         self.inputLeft = tf.placeholder(tf.float32, shape = [None, self.eyeSize, self.eyeSize, 3], name = 'input_left')
         self.inputRight = tf.placeholder(tf.float32, shape = [None, self.eyeSize, self.eyeSize, 3], name = 'input_right')
@@ -448,11 +451,14 @@ class Model(nn.NNModel):
             tf.summary.scalar('errorCm', self.errorCm)
         return self.loss
 
-    def buildTrainer(self, loss, learningRate = 0.001):
+    def buildTrainer(self, loss, learningRate = 0.00051):
         self.global_step = tf.Variable(0, trainable=False)
         if(self.useRateDecay):
             decay_r = self.dataSize / self.batchSize * self.rateDecayEpoch
-            self.learning_rate = tf.train.exponential_decay(learningRate, self.global_step, int(decay_r), 0.7, staircase=True)
+            if not self.useCycleRate:
+                self.learning_rate = tf.train.exponential_decay(learningRate, self.global_step, int(decay_r), 0.7, staircase=True)
+            else:
+                self.learning_rate = nn.LoopedExponentialDecayLearningRate(self.global_step, learningRate)
         else:
             self.learning_rate = tf.constant(learningRate)
         tf.summary.scalar('learningRate', self.learning_rate)
@@ -578,7 +584,14 @@ class ModelTester:
         if useSELU:
             dropRate = 0.0
         sess = model.sess
-        fetch = sess.run([output], { inputLeft : batchData.left, inputRight : batchData.right, inputFace : batchData.face, phase_train : False, keep_prob : dropRate })
+        feedDict = { phase_train : False, keep_prob : dropRate }
+        if not(inputLeft is None):
+            feedDict[inputLeft] = batchData.left
+        if not(inputRight is None):
+            feedDict[inputRight] = batchData.right
+        if not(inputFace is None):
+            feedDict[inputFace] = batchData.face
+        fetch = sess.run([output], feedDict)
         result = np.sqrt(np.average(np.square(fetch[0] - batchData.label)) * 2)
         self.label =  batchData.label
         self.result = fetch[0]
@@ -586,14 +599,18 @@ class ModelTester:
         return result
 
 class ModelLoader:
-    def __init__(self, pbFile, useBnorm = False, useSELU = True):
+    def __init__(self, pbFile, useBnorm = False, useSELU = True, useLeft = True, useRight = True, useFace = True):
         self.graph = self.load_graph(pbFile)
         config = tf.ConfigProto()
         config.gpu_options.allow_growth = True
         self.sess = tf.Session(config = config, graph = self.graph)
-        self.inputLeft = self.graph.get_tensor_by_name('name/input_left:0')
-        self.inputRight = self.graph.get_tensor_by_name('name/input_right:0')
-        self.inputFace = self.graph.get_tensor_by_name('name/input_face:0')
+        self.inputLeft = self.inputRight = self.inputFace = None
+        if(useLeft):
+            self.inputLeft = self.graph.get_tensor_by_name('name/input_left:0')
+        if(useRight):
+            self.inputRight = self.graph.get_tensor_by_name('name/input_right:0')
+        if(useFace):
+            self.inputFace = self.graph.get_tensor_by_name('name/input_face:0')
         self.keep_prob = self.graph.get_tensor_by_name('name/keep_prob:0')
         self.output = self.graph.get_tensor_by_name('name/output:0')
         if(useBnorm or useSELU):
@@ -616,10 +633,13 @@ class ModelLoader:
         return graph
 
 class ModelSaver:
-    def __init__(self, parentPath, checkpointName, useBnorm = False):
+    def __init__(self, parentPath, checkpointName, useBnorm = False, useLeft = True, useRight = True, useFace = True):
         self.parentPath = parentPath
         self.checkpointName = checkpointName
         self.useBnorm = useBnorm
+        self.useLeft = useLeft
+        self.useRight = useRight
+        self.useFace = useFace
         self.load()
     
     def load(self):
@@ -631,15 +651,20 @@ class ModelSaver:
         print("restoring...")
         saver.restore(self.sess, os.path.join(self.parentPath, self.checkpointName))
         graph = self.sess.graph
-        self.inputLeft = graph.get_tensor_by_name('input_left:0')
-        self.inputRight = graph.get_tensor_by_name('input_right:0')
-        self.inputFace = graph.get_tensor_by_name('input_face:0')
+        self.inputFace = self.inputLeft = self.inputRight = None
+        if(self.useLeft):
+            self.inputLeft = graph.get_tensor_by_name('input_left:0')
+        if(self.useRight):
+            self.inputRight = graph.get_tensor_by_name('input_right:0')
+        if(self.useFace):
+            self.inputFace = graph.get_tensor_by_name('input_face:0')
         self.keep_prob = graph.get_tensor_by_name('keep_prob:0')
         self.output = graph.get_tensor_by_name('output:0')
         self.phase_train = graph.get_tensor_by_name('phase_train:0')
     
     def freeze(self):
         gd = self.sess.graph.as_graph_def()
+
         print("convt..")
         for node in gd.node:
             if node.op == 'RefSwitch':
@@ -652,28 +677,45 @@ class ModelSaver:
                 if 'use_locking' in node.attr: del node.attr['use_locking']
         print("const...")
         gd = graph_util.convert_variables_to_constants(self.sess, gd, ["output"])
-
         optlib.ensure_graph_is_valid(gd)
-        input_node_names = ["input_left", "input_right", "input_face", "keep_prob", "phase_train"]
+        
+        input_node_names = []
+        placeholder_type_enum = []
+        if(self.useLeft):
+            input_node_names.append("input_left")
+            placeholder_type_enum.append(tf.float32)
+        if(self.useRight):
+            input_node_names.append("input_left")
+            placeholder_type_enum.append(tf.float32)
+        if(self.useFace):
+            input_node_names.append("input_left")
+            placeholder_type_enum.append(tf.float32)
+        input_node_names.append("keep_prob")
+        placeholder_type_enum.append(tf.float32)
+        input_node_names.append("phase_train")
+        placeholder_type_enum.append(tf.bool)
         output_node_names = ["output"]
-        placeholder_type_enum = [tf.float32, tf.float32, tf.float32, tf.float32, tf.bool]
+
         for i in range(len(placeholder_type_enum)):
             placeholder_type_enum[i] = placeholder_type_enum[i].as_datatype_enum
+        
         print("strip...")
         gd = strip_unused_lib.strip_unused(gd, input_node_names, output_node_names, placeholder_type_enum)
         optlib.ensure_graph_is_valid(gd)
+
         filename = 'frozen ' + time.strftime(R" %m-%d_%H-%M-%S", time.localtime()) + '.pb'
         tf.train.write_graph(gd, self.parentPath, filename, as_text=False)
+
         return os.path.join(self.parentPath, filename)
 
-def testAndFreeze(sessName):
+def testAndFreeze(sessName, useLeft = True, useRight = True, useFace = True):
     def listDirs(dir):
         for (_, dirs, files) in os.walk(dir):
             return dirs
     def listFiles(dir):
         for _, dirs, files in os.walk(dir):
             return files
-    data = loadData(eyeSize = 60, faceSize = 32)
+    data = loadData(eyeSize = 64, faceSize = 32)
     targetDir = './temp/' + sessName
     files = listFiles(targetDir)
     ckptNames = []
@@ -682,9 +724,9 @@ def testAndFreeze(sessName):
             cname = os.path.basename(f)[:-5]
             ckptNames.append(cname)
     ckptNames.sort()
-    model = ModelSaver(targetDir, ckptNames[-1])
+    model = ModelSaver(targetDir, ckptNames[-1], useBnorm = False, useLeft=useLeft, useRight=useRight, useFace=useFace)
     pbFile = model.freeze()
-    frozen = ModelLoader(pbFile)
+    frozen = ModelLoader(pbFile, useBnorm=False, useSELU=True, useLeft=useLeft, useRight=useRight, useFace=useFace)
     tester = ModelTester()
     tester.test(frozen, data.batchTest(100), useBnorm = False, useSELU = True)
     tester.plot()
@@ -699,7 +741,8 @@ def train():
     lastEphoc = 0
     fpsCounter = FpsCounter()
 
-    mode = "eye"
+    mode = "face"
+
     if mode=="eye":
         eyeSize = 64
         data = loadData(faceSize = faceSize, eyeSize = eyeSize, decodeLeft = True, decodeRight = False, decodeFace = False)
@@ -711,9 +754,10 @@ def train():
             rateDecayEpoch = 12,
             useSELU = True,
             useSwitching = True,
-            useWeightDecay = False,
+            useWeightDecay = True,
             useMobileNet = False)
     else:
+        eyeSize = 32
         data = loadData(faceSize = faceSize, eyeSize = eyeSize)
         model = Model(\
             faceSize = faceSize, 
@@ -725,7 +769,8 @@ def train():
             rateDecayEpoch = 12,
             useSwitching = True,
             useWeightDecay = True,
-            useMobileNet = True)
+            useMobileNet = False,
+            useCycleRate=True)
     nn.weightReport()
 
     def signal_handler(signal, frame):
@@ -784,4 +829,4 @@ def train():
 
 if (__name__ == '__main__'):
     train()
-    #testAndFreeze('test 04-07_18-54-48')
+    #testAndFreeze('test 07-11_20-56-21', useLeft=True, useRight=False, useFace=False)
